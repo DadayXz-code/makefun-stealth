@@ -1,142 +1,253 @@
-// Screenshot scenes behind ?shot=start|play|alert|end. Each one plays the real rules
-// forward from a fresh world, steered by a waypoint autopilot that freezes and sneaks
-// whenever a guard starts to suspect it, so the frame is what a careful run really
-// looks like — and the same seed always gives the same frame. The play scene then
-// advances to the moment in the next patrol loop where the guards' cones read
-// longest, so the shot shows the cones at their best.
-import { STEP, TILE } from './config.js';
-import { EVENT_CLEAR, EVENT_OVER, EVENT_WIN } from './world.js';
-import { coneReach, SCREEN_CLEAR, SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
+// The screenshot scenes behind ?shot=start|play|alert|end. Each one plays the
+// real rules forward from a fresh world for a fixed number of steps, steered by
+// a simple autopilot, so the frame is what a short game really looks like and
+// the same seed always gives the same frame.
+//
+// The autopilot plans a route across the tile grid (Dijkstra, with a steep
+// cost for tiles a guard can see), so it walks around walls and around vision
+// cones the way a careful player would, and it runs from a guard that is
+// alert. The 'end' pilot plans the same way but ignores the cones, so it is
+// caught, as a hurried player is.
 
-const SAMPLE = STEP;
+import { COLS, CONE_HALF, ROWS, STEP, TILE, VIEW_RANGE } from './config.js';
+import { EVENT_CAUGHT, EVENT_OVER, EVENT_WIN } from './world.js';
+import { SCREEN_CLEAR, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
 
-/** Follow `waypoints` (tile coords) at fixed steps; freeze when a guard suspects. */
-function runWaypoints(world, waypoints, maxSeconds, stopWhen, bold = false, sneakIdle = true) {
-  let events = 0;
-  let index = 0;
-  let stuckTimer = 0;
-  let lastX = world.state.player.x;
-  let lastY = world.state.player.y;
-  let elapsed = 0;
-  const steps = Math.floor(maxSeconds / SAMPLE);
-  for (let i = 0; i < steps; i += 1) {
-    const s = world.state;
-    const maxSuspicion = Math.max(0, ...s.guards.map((g) => g.suspicion));
-    const anyAlert = s.guards.some((g) => g.state === 'alert');
-    let input = { x: 0, y: 0, run: false, sneak: false };
-    if (index >= waypoints.length) {
-      // Waypoints done: hold still until the stop condition or the cap.
-      input = { x: 0, y: 0, run: false, sneak: sneakIdle };
-    } else if (!bold && (maxSuspicion >= 38 || anyAlert)) {
-      input = { x: 0, y: 0, run: false, sneak: true };
-    } else {
-      const [tx, ty] = waypoints[index];
-      const wx = (tx + 0.5) * TILE;
-      const wy = (ty + 0.5) * TILE;
-      const dx = wx - s.player.x;
-      const dy = wy - s.player.y;
-      const d = Math.hypot(dx, dy);
-      if (d < 10) {
-        index += 1;
-      } else {
-        input = { x: dx / d, y: dy / d, run: false, sneak: false };
+const START_SECONDS = 5;
+const PLAY_SECONDS = 15;
+const ALERT_SECONDS = 30;
+const END_LIMIT_SECONDS = 600;
+
+/** Probe a step ahead: is the point (x, y) on walkable ground? */
+function probe(world, x, y) {
+  return world.isWalkable(x, y);
+}
+
+/** Steer toward (tx, ty), trying the direct way first, then wider turns. */
+function steerToward(world, tx, ty) {
+  const player = world.state.player;
+  const want = Math.atan2(ty - player.y, tx - player.x);
+  const candidates = [0, Math.PI / 4, -Math.PI / 4, Math.PI / 2, -Math.PI / 2, (3 * Math.PI) / 4, (-3 * Math.PI) / 4, Math.PI];
+  for (const turn of candidates) {
+    const angle = want + turn;
+    const ahead = 22;
+    if (probe(world, player.x + Math.cos(angle) * ahead, player.y + Math.sin(angle) * ahead)) {
+      return { x: Math.cos(angle), y: Math.sin(angle), run: false, sneak: false };
+    }
+  }
+  return { x: 0, y: 0, run: false, sneak: false };
+}
+
+/** The nearest intel file not yet lifted, else the exit. */
+function nextTarget(world) {
+  const state = world.state;
+  let best = null;
+  let bestDist = Infinity;
+  for (const item of state.intel) {
+    if (item.taken) continue;
+    const d = Math.hypot(item.x - state.player.x, item.y - state.player.y);
+    if (d < bestDist) {
+      bestDist = d;
+      best = item;
+    }
+  }
+  return best ?? state.exit;
+}
+
+/** The cautious pilot: toward the target, running away from any guard that is alert. */
+function carefulPilot(world) {
+  const alert = world.state.guards.find((g) => g.state === 'alert');
+  if (alert) return fleeFrom(world, alert);
+  const target = nextTarget(world);
+  return followRoute(world, target.x, target.y, true);
+}
+
+/** Whether the point (x, y) sits inside any guard's vision cone right now. */
+function exposedAt(world, x, y) {
+  for (const guard of world.state.guards) {
+    const dx = x - guard.x;
+    const dy = y - guard.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist > VIEW_RANGE) continue;
+    let diff = Math.atan2(dy, dx) - guard.angle;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    if (Math.abs(diff) > CONE_HALF) continue;
+    if (!world.hasLineOfSight(guard.x, guard.y, x, y)) continue;
+    return true;
+  }
+  return false;
+}
+
+/** Follow a Dijkstra route to (tx, ty): around the walls, and around the
+ * guards' cones too when `avoid` is set. Replanned every step, so the route
+ * follows the cones as the guards walk. */
+function followRoute(world, tx, ty, avoid) {
+  const { dist, prev, start } = dijkstra(world, avoid ? coneCost : () => 0);
+  const gx = Math.floor(tx / TILE);
+  const gy = Math.floor(ty / TILE);
+  const gk = gy * COLS + gx;
+  if (!dist.has(gk)) return steerToward(world, tx, ty);
+  const path = pathFrom(prev, start, [gx, gy]);
+  if (path.length === 0) return steerToward(world, tx, ty);
+  const [nx, ny] = path[0];
+  return steerToward(world, (nx + 0.5) * TILE, (ny + 0.5) * TILE);
+}
+
+/** Extra cost of stepping on a tile: steep when a guard can see it. */
+function coneCost(world, tx, ty) {
+  return exposedAt(world, (tx + 0.5) * TILE, (ty + 0.5) * TILE) ? 12 : 0;
+}
+
+/** Dijkstra over the tile grid from the player's tile. `costFn(world, tx, ty)`
+ * adds the extra cost of a tile on top of 1 per step. Returns the distance
+ * and predecessor maps (keys are ty * COLS + tx) and the start tile. */
+function dijkstra(world, costFn) {
+  const def = world.levelDef;
+  const px = Math.floor(world.state.player.x / TILE);
+  const py = Math.floor(world.state.player.y / TILE);
+  const key = (x, y) => y * COLS + x;
+  const solid = (x, y) => {
+    if (x < 0 || y < 0 || x >= COLS || y >= ROWS) return true;
+    const ch = def.map[y][x];
+    return ch === '#' || ch === 'C';
+  };
+  const dist = new Map([[key(px, py), 0]]);
+  const prev = new Map();
+  const open = [[0, px, py]];
+  while (open.length > 0) {
+    let bi = 0;
+    for (let i = 1; i < open.length; i += 1) if (open[i][0] < open[bi][0]) bi = i;
+    const [d, x, y] = open.splice(bi, 1)[0];
+    if (d !== dist.get(key(x, y))) continue;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx;
+      const ny = y + dy;
+      if (solid(nx, ny)) continue;
+      const nd = d + 1 + costFn(world, nx, ny);
+      if (nd < (dist.get(key(nx, ny)) ?? Infinity)) {
+        dist.set(key(nx, ny), nd);
+        prev.set(key(nx, ny), [x, y]);
+        open.push([nd, nx, ny]);
       }
     }
-    events |= world.step(SAMPLE, input, 0);
-    elapsed += SAMPLE;
-    if (stopWhen && stopWhen(world, events)) break;
-    if (events & (EVENT_CLEAR | EVENT_WIN | EVENT_OVER)) break;
-    if (Math.hypot(s.player.x - lastX, s.player.y - lastY) < 0.5) {
-      stuckTimer += SAMPLE;
-      if (stuckTimer > 2 && index < waypoints.length) {
-        index += 1;
-        stuckTimer = 0;
-      }
-    } else {
-      stuckTimer = 0;
-    }
-    lastX = s.player.x;
-    lastY = s.player.y;
   }
-  return { events, reached: index, elapsed };
+  return { dist, prev, start: [px, py] };
 }
 
-function patrolOnly(world, seconds) {
-  for (let i = 0; i < seconds / SAMPLE; i += 1) {
-    world.step(SAMPLE, { x: 0, y: 0, run: false, sneak: false }, 0);
+/** The tiles of the route from `start` to `goal`, first step first. */
+function pathFrom(prev, start, goal) {
+  const path = [];
+  let cur = goal;
+  let guard = 0;
+  while (!(cur[0] === start[0] && cur[1] === start[1]) && guard < 400) {
+    path.unshift(cur);
+    cur = prev.get(cur[1] * COLS + cur[0]);
+    if (!cur) return [];
+    guard += 1;
   }
+  return path;
 }
 
-// How readable the guards' cones are right now: the summed ray length of every cone.
-function coneScore(world) {
-  if (world.status !== 'play') return -1;
-  let total = 0;
-  for (const guard of world.state.guards) total += coneReach(world, guard);
-  return total;
-}
-
-/** Advance with the player standing still; return the best-scoring extra time. */
-function bestConeMoment(world, maxSeconds) {
-  const lives = world.lives;
-  let bestTime = 0;
-  let bestScore = coneScore(world);
-  let t = 0;
-  while (t < maxSeconds) {
-    world.step(0.25, { x: 0, y: 0, run: false, sneak: true }, 0);
-    t += 0.25;
-    if (world.lives !== lives || world.status !== 'play') break;
-    const score = coneScore(world);
+/** Run away from a guard: route to the reachable tile farthest from him. */
+function fleeFrom(world, guard) {
+  const { dist, prev, start } = dijkstra(world, coneCost);
+  let best = null;
+  let bestScore = -Infinity;
+  for (const [k, d] of dist) {
+    if (d > 8) continue;
+    const tx = k % COLS;
+    const ty = Math.floor(k / COLS);
+    const cx = (tx + 0.5) * TILE;
+    const cy = (ty + 0.5) * TILE;
+    const score = Math.hypot(cx - guard.x, cy - guard.y) - d * 4;
     if (score > bestScore) {
       bestScore = score;
-      bestTime = t;
+      best = [tx, ty];
     }
   }
-  return bestTime;
+  if (best === null) return { x: 0, y: 0, run: false, sneak: false };
+  const path = pathFrom(prev, start, best);
+  if (path.length === 0) return { x: 0, y: 0, run: false, sneak: false };
+  const [tx, ty] = path[0];
+  const step = steerToward(world, (tx + 0.5) * TILE, (ty + 0.5) * TILE);
+  return { ...step, run: true };
 }
 
-const PLAY_PATH = [[4, 1], [8, 1], [10, 2], [14, 2], [17, 1], [19, 1], [20, 4], [19, 6]];
-const END_PATH = [
-  [4, 1], [8, 1], [10, 2], [14, 2], [17, 1], [19, 1],
-  [21, 3], [21, 6], [20, 8], [18, 8],
-  [21, 8], [21, 11], [21, 13], [16, 13], [12, 13], [8, 13], [5, 12],
-  [8, 13], [12, 13], [16, 13], [20, 13], [21, 12],
-];
+/** The reckless pilot: around the walls toward the target, never mind the guards. */
+function recklessPilot(world) {
+  const target = nextTarget(world);
+  return followRoute(world, target.x, target.y, false);
+}
 
 /**
- * Set `world` to the named scene and return the screen to draw over it and the best
- * score to show. Any unknown name is the title scene.
+ * The hunting pilot: walk to a point in front of the nearest guard, inside
+ * his cone, and stay there — walking straight at a guard only ever reaches
+ * his back, and a back never raises the alarm.
+ */
+function huntingPilot(world) {
+  const state = world.state;
+  if (state.guards.some((g) => g.state === 'alert')) {
+    return { x: 0, y: 0, run: false, sneak: false };
+  }
+  let best = null;
+  let bestDist = Infinity;
+  for (const guard of state.guards) {
+    const d = Math.hypot(guard.x - state.player.x, guard.y - state.player.y);
+    if (d < bestDist) {
+      bestDist = d;
+      best = guard;
+    }
+  }
+  if (best === null) return { x: 0, y: 0, run: false, sneak: false };
+  const tx = best.x + Math.cos(best.angle) * 110;
+  const ty = best.y + Math.sin(best.angle) * 110;
+  return steerToward(world, tx, ty);
+}
+
+/**
+ * Set `world` to the named scene (start, play, alert or end; any other name is
+ * start) and return the screen to draw over it and the best score to show.
  */
 export function stageShot(name, world) {
   world.reset();
-  if (name === 'play') {
-    runWaypoints(world, PLAY_PATH, 30);
-    // The autopilot is deterministic, so re-running it to the best-scoring moment
-    // reproduces the same run, framed where the cones read longest.
-    const extra = bestConeMoment(world, 12);
-    world.reset();
-    runWaypoints(world, PLAY_PATH, 30);
-    patrolOnly(world, extra);
-    return { screen: SCREEN_PLAY, best: world.score };
+  if (name !== 'play' && name !== 'alert' && name !== 'end') {
+    for (let i = 0; i < START_SECONDS / STEP; i += 1) {
+      world.step(STEP, { x: 0, y: 0, run: false, sneak: false }, 0);
+    }
+    return { screen: SCREEN_TITLE, best: 0 };
   }
   if (name === 'alert') {
-    // Bold: stand dead-centre in front of guard 0's northbound lane and wait
-    // for him to walk up the lane into you (he pauses at the waypoint).
-    runWaypoints(
-      world,
-      [[5, 2], [7, 2], [7, 3]],
-      30,
-      (w) => Math.max(0, ...w.state.guards.map((g) => g.suspicion)) >= 72,
-      true,
-      false,
-    );
+    for (let i = 0; i < ALERT_SECONDS / STEP; i += 1) {
+      const events = world.step(STEP, huntingPilot(world), 0);
+      if (events & EVENT_CAUGHT) break;
+      if (world.state.guards.some((g) => g.state === 'alert')) {
+        // Hold the frame a moment so the '!' and the red cone read clearly —
+        // short enough that the chasing guard has not caught the player yet.
+        for (let j = 0; j < 20; j += 1) world.step(STEP, { x: 0, y: 0, run: false, sneak: false }, 0);
+        break;
+      }
+    }
     return { screen: SCREEN_PLAY, best: world.score };
   }
-  if (name === 'end') {
-    const { events } = runWaypoints(world, END_PATH, 240);
-    if (events & EVENT_WIN) return { screen: SCREEN_WIN, best: world.score };
-    if (events & EVENT_CLEAR) return { screen: SCREEN_CLEAR, best: world.score };
-    return { screen: SCREEN_PLAY, best: world.score };
+  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
+  const pilot = name === 'end' ? recklessPilot : carefulPilot;
+  let screen = SCREEN_PLAY;
+  for (let i = 0; i < limit / STEP; i += 1) {
+    const events = world.step(STEP, pilot(world), 0);
+    if (events & EVENT_WIN) {
+      screen = SCREEN_WIN;
+      break;
+    }
+    if (events & EVENT_OVER) {
+      screen = SCREEN_OVER;
+      break;
+    }
+    // A level clear just loads the next level: keep playing, so the frame
+    // always shows live play rather than a panel.
   }
-  patrolOnly(world, 5);
-  return { screen: SCREEN_TITLE, best: 0 };
+  return { screen, best: world.score };
 }
+
+// Re-exported so main.js can share the screen names without importing render.
+export { SCREEN_CLEAR, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN };

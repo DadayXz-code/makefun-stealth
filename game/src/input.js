@@ -1,79 +1,87 @@
-// Keyboard input: held keys become a movement vector each frame; presses become
-// one-shot actions the world consumes (confirm, pause, sneak toggle, throw pebble).
+// Keyboard and pointer input. Held keys give a steering vector and the run /
+// sneak modifiers; one-shot presses (start, pause, pebble, mute) are queued as
+// bit flags and taken once by the loop, so a press between two frames is never
+// lost and never counted twice.
+
 export const ACTION_CONFIRM = 1;
 export const ACTION_PAUSE = 2;
 export const ACTION_PEBBLE = 4;
+export const ACTION_MUTE = 8;
 
-export function createInput(canvas) {
-  const held = new Set();
-  let queued = 0;
+const UP = new Set(['ArrowUp', 'KeyW']);
+const DOWN = new Set(['ArrowDown', 'KeyS']);
+const LEFT = new Set(['ArrowLeft', 'KeyA']);
+const RIGHT = new Set(['ArrowRight', 'KeyD']);
+const RUN = new Set(['ShiftLeft', 'ShiftRight']);
+const SNEAK = new Set(['KeyC']);
+const CONFIRM = new Set(['Space', 'Enter']);
+const PAUSE = new Set(['KeyP', 'Escape']);
+const PEBBLE = new Set(['KeyQ']);
+const MUTE = new Set(['KeyM']);
+
+export function createInput(target) {
+  let up = false;
+  let down = false;
+  let left = false;
+  let right = false;
+  let run = false;
   let sneak = false;
+  let actions = 0;
 
-  function keyOf(event) {
-    const key = event.key.toLowerCase();
-    return key === ' ' ? 'space' : key;
-  }
-
-  function onKeyDown(event) {
-    const key = keyOf(event);
-    if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'space'].includes(key)) {
-      event.preventDefault();
-    }
-    if (event.repeat) return;
-    held.add(key);
-    if (key === 'space' || key === 'enter') queued |= ACTION_CONFIRM;
-    if (key === 'p' || key === 'escape') queued |= ACTION_PAUSE;
-    if (key === 'q') queued |= ACTION_PEBBLE;
-    if (key === 'c') sneak = !sneak;
-  }
-
-  function onKeyUp(event) {
-    held.delete(keyOf(event));
-  }
-
-  function onBlur() {
-    held.clear();
-  }
-
-  function onPointerDown() {
-    queued |= ACTION_CONFIRM;
-  }
-
-  canvas.addEventListener('keydown', onKeyDown);
-  canvas.addEventListener('keyup', onKeyUp);
-  canvas.addEventListener('blur', onBlur);
-  canvas.addEventListener('pointerdown', onPointerDown);
-  canvas.tabIndex = 0;
+  window.addEventListener('keydown', (event) => {
+    if (UP.has(event.code)) up = true;
+    else if (DOWN.has(event.code)) down = true;
+    else if (LEFT.has(event.code)) left = true;
+    else if (RIGHT.has(event.code)) right = true;
+    else if (RUN.has(event.code)) run = true;
+    else if (SNEAK.has(event.code)) sneak = true;
+    else if (CONFIRM.has(event.code)) {
+      if (!event.repeat) actions |= ACTION_CONFIRM;
+    } else if (PAUSE.has(event.code)) {
+      if (!event.repeat) actions |= ACTION_PAUSE;
+    } else if (PEBBLE.has(event.code)) {
+      if (!event.repeat) actions |= ACTION_PEBBLE;
+    } else if (MUTE.has(event.code)) {
+      if (!event.repeat) actions |= ACTION_MUTE;
+    } else return;
+    event.preventDefault();
+  });
+  window.addEventListener('keyup', (event) => {
+    if (UP.has(event.code)) up = false;
+    else if (DOWN.has(event.code)) down = false;
+    else if (LEFT.has(event.code)) left = false;
+    else if (RIGHT.has(event.code)) right = false;
+    else if (RUN.has(event.code)) run = false;
+    else if (SNEAK.has(event.code)) sneak = false;
+  });
+  // A key released while the tab is hidden never sends keyup: let go of everything on blur.
+  window.addEventListener('blur', () => {
+    up = false;
+    down = false;
+    left = false;
+    right = false;
+    run = false;
+    sneak = false;
+  });
+  target.addEventListener('pointerdown', () => {
+    actions |= ACTION_CONFIRM;
+  });
 
   return {
-    // Normalised -1..1 movement vector from WASD / arrows.
-    direction() {
-      let x = 0;
-      let y = 0;
-      if (held.has('a') || held.has('arrowleft')) x -= 1;
-      if (held.has('d') || held.has('arrowright')) x += 1;
-      if (held.has('w') || held.has('arrowup')) y -= 1;
-      if (held.has('s') || held.has('arrowdown')) y += 1;
-      if (x !== 0 && y !== 0) {
-        const inv = 1 / Math.hypot(x, y);
-        x *= inv;
-        y *= inv;
-      }
-      return { x, y };
+    /** The steering vector and modifiers the world steps with. */
+    vector() {
+      return {
+        x: (right ? 1 : 0) - (left ? 1 : 0),
+        y: (down ? 1 : 0) - (up ? 1 : 0),
+        run,
+        sneak,
+      };
     },
-    running() {
-      return held.has('shift');
-    },
-    sneaking() {
-      return sneak || held.has('control');
-    },
+    /** The one-shot presses since the last call, as ACTION_* flags. */
     takeActions() {
-      const actions = queued;
-      queued = 0;
-      return actions;
-    },
-    resetSneak() {
-      sneak = false;
+      const taken = actions;
+      actions = 0;
+      return taken;
     },
   };
 }

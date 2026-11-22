@@ -1,40 +1,70 @@
-// Procedural sound: no audio files, just a few WebAudio blips. Created lazily on the
-// first user gesture so browsers allow it; every call is safe before that.
+// Procedural WebAudio sound: no audio files, every effect is a short oscillator
+// or noise burst shaped by a gain envelope. The context is created lazily on
+// the first user gesture (browsers block audio before one) and stays muted
+// until then; M toggles it.
+
 export function createAudio() {
   let context = null;
   let muted = false;
+  let master = null;
 
   function ensure() {
-    if (!context) {
-      try {
-        const AudioContext = window.AudioContext || window.webkitAudioContext;
-        context = new AudioContext();
-      } catch {
-        context = null;
-      }
+    if (context !== null) return true;
+    try {
+      const AC = window.AudioContext ?? window.webkitAudioContext;
+      if (!AC) return false;
+      context = new AC();
+      master = context.createGain();
+      master.gain.value = 0.5;
+      master.connect(context.destination);
+    } catch {
+      return false;
     }
-    if (context && context.state === 'suspended') context.resume();
-    return context;
+    return true;
   }
 
-  function tone(freq, dur, type, gain, when = 0, slideTo = 0) {
-    const ctx = ensure();
-    if (!ctx || muted) return;
-    const t0 = ctx.currentTime + when;
-    const osc = ctx.createOscillator();
-    const amp = ctx.createGain();
+  function tone(freq, dur, type, vol, slideTo) {
+    if (!ensure() || muted || context === null || master === null) return;
+    if (context.state === 'suspended') void context.resume();
+    const now = context.currentTime;
+    const osc = context.createOscillator();
+    const gain = context.createGain();
     osc.type = type;
-    osc.frequency.setValueAtTime(freq, t0);
-    if (slideTo) osc.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
-    amp.gain.setValueAtTime(gain, t0);
-    amp.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-    osc.connect(amp);
-    amp.connect(ctx.destination);
-    osc.start(t0);
-    osc.stop(t0 + dur + 0.02);
+    osc.frequency.setValueAtTime(freq, now);
+    if (slideTo !== undefined) osc.frequency.exponentialRampToValueAtTime(Math.max(1, slideTo), now + dur);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(vol, now + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+    osc.connect(gain);
+    gain.connect(master);
+    osc.start(now);
+    osc.stop(now + dur + 0.05);
+  }
+
+  function noise(dur, vol, low) {
+    if (!ensure() || muted || context === null || master === null) return;
+    if (context.state === 'suspended') void context.resume();
+    const now = context.currentTime;
+    const len = Math.max(1, Math.floor(context.sampleRate * dur));
+    const buffer = context.createBuffer(1, len, context.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < len; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const src = context.createBufferSource();
+    src.buffer = buffer;
+    const filter = context.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = low ?? 1200;
+    const gain = context.createGain();
+    gain.gain.setValueAtTime(vol, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+    src.connect(filter);
+    filter.connect(gain);
+    gain.connect(master);
+    src.start(now);
   }
 
   return {
+    /** Call from a user gesture so the browser lets audio start. */
     unlock() {
       ensure();
     },
@@ -42,39 +72,48 @@ export function createAudio() {
       muted = !muted;
       return muted;
     },
-    footstep() {
-      tone(140, 0.05, 'sine', 0.045);
+    get muted() {
+      return muted;
     },
-    // Soft ticks that get louder as a guard walks near: the sound tells you where he is.
-    guardStep(distance) {
-      const gain = Math.max(0.008, 0.075 * (1 - distance / 260));
-      tone(95, 0.06, 'triangle', gain);
-    },
-    pickup() {
-      tone(660, 0.09, 'sine', 0.09);
-      tone(990, 0.14, 'sine', 0.09, 0.08);
+    footstep(run) {
+      noise(run ? 0.09 : 0.06, run ? 0.22 : 0.1, run ? 900 : 500);
     },
     pebble() {
-      tone(1200, 0.05, 'square', 0.05, 0, 500);
+      tone(1400, 0.08, 'sine', 0.25, 900);
+      noise(0.05, 0.12, 3000);
     },
-    suspicious() {
-      tone(520, 0.12, 'square', 0.06, 0, 760);
+    ring() {
+      tone(880, 0.5, 'sine', 0.16, 660);
+      tone(1320, 0.35, 'sine', 0.08, 990);
+    },
+    pickup() {
+      tone(660, 0.12, 'sine', 0.22, 990);
+      tone(990, 0.18, 'sine', 0.18, 1320);
+    },
+    suspect() {
+      tone(520, 0.16, 'square', 0.1, 520);
     },
     alarm() {
-      tone(392, 0.16, 'sawtooth', 0.08);
-      tone(311, 0.2, 'sawtooth', 0.08, 0.15);
-    },
-    caught() {
-      tone(220, 0.3, 'sawtooth', 0.1, 0, 110);
+      tone(440, 0.4, 'sawtooth', 0.16, 880);
+      tone(880, 0.4, 'sawtooth', 0.1, 440);
     },
     laser() {
-      tone(880, 0.1, 'square', 0.06, 0, 440);
+      tone(180, 0.3, 'sawtooth', 0.2, 90);
+      noise(0.15, 0.15, 2000);
     },
-    levelClear() {
-      [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.16, 'sine', 0.09, i * 0.09));
+    caught() {
+      tone(220, 0.5, 'sawtooth', 0.22, 55);
+    },
+    clear() {
+      tone(523, 0.14, 'sine', 0.2);
+      tone(659, 0.14, 'sine', 0.2);
+      tone(784, 0.3, 'sine', 0.22);
     },
     win() {
-      [523, 659, 784, 1047, 1319].forEach((f, i) => tone(f, 0.22, 'sine', 0.09, i * 0.11));
+      tone(523, 0.16, 'sine', 0.2);
+      tone(659, 0.16, 'sine', 0.2);
+      tone(784, 0.16, 'sine', 0.2);
+      tone(1047, 0.5, 'sine', 0.22);
     },
   };
 }

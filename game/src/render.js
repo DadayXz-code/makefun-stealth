@@ -1,356 +1,361 @@
-// Ghostline renderer: one canvas, night palette. Vision cones are clipped by walls
-// with a ray fan, so a cone stops at a crate exactly where your eyes say it should.
-import { COLS, GUARD, PLAYER, ROWS, TILE } from './config.js';
+// Drawing only: the world's state and the current screen in, pixels out. The
+// 800x600 playfield is scaled to fit the window and centred, the margin filled
+// with the backdrop colour. Vision cones are raycast, so a wall or crate cuts
+// the cone exactly where it cuts the guard's sight. Flat shapes and canvas
+// text for the HUD and the panels.
+
+import {
+  COLS,
+  CONE_HALF,
+  FIELD_HEIGHT,
+  FIELD_WIDTH,
+  FONT,
+  LIVES,
+  PALETTE,
+  ROWS,
+  TILE,
+  VIEW_RANGE,
+} from './config.js';
 
 export const SCREEN_TITLE = 'title';
 export const SCREEN_PLAY = 'play';
 export const SCREEN_PAUSED = 'paused';
+export const SCREEN_CLEAR = 'clear';
 export const SCREEN_OVER = 'over';
 export const SCREEN_WIN = 'win';
-export const SCREEN_CLEAR = 'clear';
 
-const W = COLS * TILE;
-const H = ROWS * TILE;
-const RAYS = 26;
-
-function conePolygon(world, guard) {
-  const s = world.state;
-  const points = [{ x: guard.x, y: guard.y }];
-  const half = GUARD.viewHalfAngle;
-  for (let i = 0; i <= RAYS; i += 1) {
-    const a = guard.angle - half + (2 * half * i) / RAYS;
-    const dx = Math.cos(a);
-    const dy = Math.sin(a);
-    let d = 0;
-    while (d < GUARD.viewDistance) {
-      d += 6;
-      const x = guard.x + dx * d;
-      const y = guard.y + dy * d;
-      const tx = Math.floor(x / TILE);
-      const ty = Math.floor(y / TILE);
-      if (tx < 0 || ty < 0 || tx >= COLS || ty >= ROWS) break;
-      if (s.grid[ty][tx] === '#' || s.grid[ty][tx] === 'C') break;
-    }
-    points.push({ x: guard.x + dx * Math.min(d, GUARD.viewDistance), y: guard.y + dy * Math.min(d, GUARD.viewDistance) });
-  }
-  return points;
-}
-
-export function coneReach(world, guard) {
-  const poly = conePolygon(world, guard);
-  let total = 0;
-  for (let i = 1; i < poly.length; i += 1) total += Math.hypot(poly[i].x - guard.x, poly[i].y - guard.y);
-  return total;
-}
+const CONE_RAYS = 26;
 
 export function createRenderer(canvas) {
-  const ctx = canvas.getContext('2d');
-  canvas.width = W;
-  canvas.height = H;
+  const context = canvas.getContext('2d');
+  const view = { scale: 1, x: 0, y: 0 };
+  const fonts = new Map();
 
-  function drawFloor(s) {
+  function resize() {
+    const ratio = window.devicePixelRatio || 1;
+    const width = Math.round(window.innerWidth * ratio);
+    const height = Math.round(window.innerHeight * ratio);
+    canvas.width = width;
+    canvas.height = height;
+    view.scale = Math.min(width / FIELD_WIDTH, height / FIELD_HEIGHT);
+    view.x = (width - FIELD_WIDTH * view.scale) / 2;
+    view.y = (height - FIELD_HEIGHT * view.scale) / 2;
+  }
+
+  function text(value, x, y, size, color, align, baseline) {
+    if (!fonts.has(size)) fonts.set(size, `${size}px ${FONT}`);
+    context.font = fonts.get(size);
+    context.fillStyle = color;
+    context.textAlign = align ?? 'left';
+    context.textBaseline = baseline ?? 'alphabetic';
+    context.fillText(value, x, y);
+  }
+
+  function isSolidTile(def, tx, ty) {
+    if (tx < 0 || ty < 0 || tx >= COLS || ty >= ROWS) return true;
+    const ch = def.map[ty][tx];
+    return ch === '#' || ch === 'C';
+  }
+
+  /** Cast one ray of the cone until it hits a wall, and return its length. */
+  function rayLength(def, gx, gy, angle) {
+    const dx = Math.cos(angle);
+    const dy = Math.sin(angle);
+    let len = 0;
+    while (len < VIEW_RANGE) {
+      len += 8;
+      const x = gx + dx * len;
+      const y = gy + dy * len;
+      if (isSolidTile(def, Math.floor(x / TILE), Math.floor(y / TILE))) return len;
+    }
+    return VIEW_RANGE;
+  }
+
+  function drawCone(def, guard) {
+    const color = guard.state === 'alert' ? PALETTE.coneAlert : PALETTE.cone;
+    context.fillStyle = color;
+    context.beginPath();
+    context.moveTo(guard.x, guard.y);
+    for (let i = 0; i <= CONE_RAYS; i += 1) {
+      const angle = guard.angle - CONE_HALF + (2 * CONE_HALF * i) / CONE_RAYS;
+      const len = rayLength(def, guard.x, guard.y, angle);
+      context.lineTo(guard.x + Math.cos(angle) * len, guard.y + Math.sin(angle) * len);
+    }
+    context.closePath();
+    context.fill();
+  }
+
+  function drawField(world, def) {
+    const state = world.state;
+    // Floor, checkerboard by tile.
     for (let y = 0; y < ROWS; y += 1) {
       for (let x = 0; x < COLS; x += 1) {
-        const ch = s.grid[y][x];
-        const px = x * TILE;
-        const py = y * TILE;
+        const ch = def.map[y][x];
         if (ch === '#') {
-          ctx.fillStyle = '#2b3a57';
-          ctx.fillRect(px, py, TILE, TILE);
-          ctx.fillStyle = '#3d5178';
-          ctx.fillRect(px, py, TILE, 5);
-          ctx.fillStyle = '#1d2942';
-          ctx.fillRect(px, py + TILE - 4, TILE, 4);
+          context.fillStyle = PALETTE.wall;
+          context.fillRect(x * TILE, y * TILE, TILE, TILE);
+          context.fillStyle = PALETTE.wallTop;
+          context.fillRect(x * TILE, y * TILE, TILE, 4);
+        } else if (ch === 'C') {
+          context.fillStyle = PALETTE.floor;
+          context.fillRect(x * TILE, y * TILE, TILE, TILE);
+          context.fillStyle = PALETTE.crate;
+          context.fillRect(x * TILE + 4, y * TILE + 4, TILE - 8, TILE - 8);
+          context.strokeStyle = PALETTE.crateEdge;
+          context.lineWidth = 2;
+          context.strokeRect(x * TILE + 4, y * TILE + 4, TILE - 8, TILE - 8);
+          context.beginPath();
+          context.moveTo(x * TILE + 4, y * TILE + 4);
+          context.lineTo(x * TILE + TILE - 4, y * TILE + TILE - 4);
+          context.moveTo(x * TILE + TILE - 4, y * TILE + 4);
+          context.lineTo(x * TILE + 4, y * TILE + TILE - 4);
+          context.stroke();
         } else {
-          const shade = (x * 7 + y * 13) % 3;
-          ctx.fillStyle = shade === 0 ? '#171f30' : shade === 1 ? '#182234' : '#151d2e';
-          ctx.fillRect(px, py, TILE, TILE);
-          ctx.strokeStyle = 'rgba(255,255,255,0.03)';
-          ctx.strokeRect(px + 0.5, py + 0.5, TILE, TILE);
+          context.fillStyle = (x + y) % 2 === 0 ? PALETTE.floor : PALETTE.floorAlt;
+          context.fillRect(x * TILE, y * TILE, TILE, TILE);
         }
-        if (ch === 'C') {
-          ctx.fillStyle = '#6b4f2a';
-          ctx.fillRect(px + 4, py + 4, TILE - 8, TILE - 8);
-          ctx.strokeStyle = '#8a6a3c';
-          ctx.lineWidth = 2;
-          ctx.strokeRect(px + 4, py + 4, TILE - 8, TILE - 8);
-          ctx.beginPath();
-          ctx.moveTo(px + 4, py + 4);
-          ctx.lineTo(px + TILE - 4, py + TILE - 4);
-          ctx.moveTo(px + TILE - 4, py + 4);
-          ctx.lineTo(px + 4, py + TILE - 4);
-          ctx.stroke();
-          ctx.lineWidth = 1;
-        } else if (ch === 'B') {
-          ctx.fillStyle = '#173d24';
-          ctx.fillRect(px, py, TILE, TILE);
-          ctx.fillStyle = '#1f5232';
-          for (let i = 0; i < 5; i += 1) {
-            const bx = px + 6 + ((x * 11 + y * 5 + i * 7) % 28);
-            const by = py + 6 + ((x * 3 + y * 9 + i * 11) % 28);
-            ctx.beginPath();
-            ctx.arc(bx, by, 5, 0, Math.PI * 2);
-            ctx.fill();
+        if (ch === 'B') {
+          context.fillStyle = PALETTE.bush;
+          context.fillRect(x * TILE + 2, y * TILE + 2, TILE - 4, TILE - 4);
+          context.fillStyle = PALETTE.bushLeaf;
+          for (const [ox, oy, r] of [[10, 12, 7], [26, 10, 8], [20, 26, 7], [32, 28, 6]]) {
+            context.beginPath();
+            context.arc(x * TILE + ox, y * TILE + oy, r, 0, Math.PI * 2);
+            context.fill();
           }
         }
       }
     }
-  }
 
-  function drawLasers(s) {
-    for (const laser of s.lasers) {
-      const lit = laser.lit !== false;
-      ctx.strokeStyle = lit ? 'rgba(255,60,70,0.9)' : 'rgba(255,60,70,0.18)';
-      ctx.lineWidth = lit ? 3 : 1.5;
-      ctx.setLineDash(lit ? [] : [6, 6]);
-      ctx.beginPath();
-      ctx.moveTo(laser.x1, laser.y1);
-      ctx.lineTo(laser.x2, laser.y2);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.lineWidth = 1;
-      ctx.fillStyle = '#ff5566';
-      ctx.beginPath();
-      ctx.arc(laser.x1, laser.y1, 5, 0, Math.PI * 2);
-      ctx.arc(laser.x2, laser.y2, 5, 0, Math.PI * 2);
-      ctx.fill();
+    // Exit: a door on the wall edge of the map, locked red until every file is lifted.
+    const exit = state.exit;
+    context.fillStyle = state.exitOpen ? PALETTE.exitOpen : PALETTE.exitLocked;
+    context.fillRect(exit.x - 14, exit.y - 14, 28, 28);
+    context.fillStyle = PALETTE.panel;
+    context.fillRect(exit.x - 9, exit.y - 9, 18, 18);
+    if (state.exitOpen) {
+      context.fillStyle = PALETTE.exitOpen;
+      context.beginPath();
+      context.moveTo(exit.x - 5, exit.y);
+      context.lineTo(exit.x - 1, exit.y + 5);
+      context.lineTo(exit.x + 6, exit.y - 5);
+      context.lineWidth = 3;
+      context.strokeStyle = PALETTE.exitOpen;
+      context.stroke();
+    } else {
+      context.fillStyle = PALETTE.exitLocked;
+      context.fillRect(exit.x - 3, exit.y - 6, 6, 8);
+      context.beginPath();
+      context.arc(exit.x, exit.y + 3, 4, 0, Math.PI * 2);
+      context.fill();
     }
-  }
 
-  function drawIntelAndExit(s) {
-    for (const item of s.intel) {
+    // Intel files: gold diamonds.
+    for (const item of state.intel) {
       if (item.taken) continue;
-      const pulse = 0.6 + 0.4 * Math.sin(s.time * 4 + item.x);
-      ctx.fillStyle = `rgba(255,214,90,${0.25 * pulse})`;
-      ctx.beginPath();
-      ctx.arc(item.x, item.y, 20, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#ffd65a';
-      ctx.fillRect(item.x - 8, item.y - 10, 16, 20);
-      ctx.fillStyle = '#1a2233';
-      ctx.fillRect(item.x - 5, item.y - 6, 10, 3);
-      ctx.fillRect(item.x - 5, item.y - 1, 10, 3);
-      ctx.fillRect(item.x - 5, item.y + 4, 7, 3);
+      const pulse = 1 + 0.12 * Math.sin(world.world.time * 4 + item.x);
+      context.fillStyle = PALETTE.intel;
+      context.beginPath();
+      context.moveTo(item.x, item.y - 10 * pulse);
+      context.lineTo(item.x + 8 * pulse, item.y);
+      context.lineTo(item.x, item.y + 10 * pulse);
+      context.lineTo(item.x - 8 * pulse, item.y);
+      context.closePath();
+      context.fill();
+      context.fillStyle = PALETTE.panel;
+      context.fillRect(item.x - 2, item.y - 4, 4, 8);
     }
-    const e = s.exit;
-    ctx.fillStyle = s.exitOpen ? 'rgba(80,255,170,0.25)' : 'rgba(120,140,170,0.18)';
-    ctx.fillRect(e.x - 18, e.y - 18, 36, 36);
-    ctx.strokeStyle = s.exitOpen ? '#50ffaa' : '#7d90ad';
-    ctx.lineWidth = 3;
-    ctx.strokeRect(e.x - 18, e.y - 18, 36, 36);
-    ctx.fillStyle = s.exitOpen ? '#50ffaa' : '#7d90ad';
-    ctx.font = 'bold 13px system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(s.exitOpen ? 'EXIT' : 'LOCK', e.x, e.y + 30);
-    ctx.lineWidth = 1;
-  }
 
-  function drawGuards(world) {
-    const s = world.state;
-    for (const guard of s.guards) {
-      // Vision cone, clipped by walls.
-      const poly = conePolygon(world, guard);
-      const alert = guard.state === 'alert';
-      const suspect = guard.state === 'suspect' || guard.state === 'search';
-      ctx.fillStyle = alert
-        ? 'rgba(255,70,70,0.38)'
-        : suspect
-          ? 'rgba(255,165,60,0.30)'
-          : 'rgba(255,220,90,0.26)';
-      ctx.beginPath();
-      ctx.moveTo(poly[0].x, poly[0].y);
-      for (let i = 1; i < poly.length; i += 1) ctx.lineTo(poly[i].x, poly[i].y);
-      ctx.closePath();
-      ctx.fill();
-      ctx.strokeStyle = alert ? 'rgba(255,70,70,0.65)' : 'rgba(255,220,90,0.4)';
-      ctx.stroke();
+    // Lasers: bright when lit, a faint dashed line while dark.
+    for (const laser of state.lasers) {
+      if (laser.lit) {
+        context.strokeStyle = PALETTE.laser;
+        context.lineWidth = 3;
+        context.beginPath();
+        context.moveTo(laser.x1, laser.y1);
+        context.lineTo(laser.x2, laser.y2);
+        context.stroke();
+        context.fillStyle = PALETTE.laser;
+        for (const [ex, ey] of [[laser.x1, laser.y1], [laser.x2, laser.y2]]) {
+          context.beginPath();
+          context.arc(ex, ey, 4, 0, Math.PI * 2);
+          context.fill();
+        }
+      } else {
+        context.strokeStyle = PALETTE.laserDark;
+        context.lineWidth = 2;
+        context.setLineDash([6, 6]);
+        context.beginPath();
+        context.moveTo(laser.x1, laser.y1);
+        context.lineTo(laser.x2, laser.y2);
+        context.stroke();
+        context.setLineDash([]);
+      }
+    }
 
-      // Body: a guard with a facing tick and a state mark.
-      ctx.fillStyle = alert ? '#ff5252' : suspect ? '#ffab40' : '#ffb74d';
-      ctx.beginPath();
-      ctx.arc(guard.x, guard.y, GUARD.radius, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = '#201409';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(guard.x, guard.y);
-      ctx.lineTo(guard.x + Math.cos(guard.angle) * (GUARD.radius + 7), guard.y + Math.sin(guard.angle) * (GUARD.radius + 7));
-      ctx.strokeStyle = '#201409';
-      ctx.lineWidth = 3;
-      ctx.stroke();
-      ctx.lineWidth = 1;
-      if (guard.suspicion > 8) {
+    // Sound rings from a landed pebble.
+    for (const ring of state.rings) {
+      const progress = 1 - ring.t / 0.6;
+      context.strokeStyle = `rgba(201, 206, 214, ${0.7 * (1 - progress)})`;
+      context.lineWidth = 2;
+      context.beginPath();
+      context.arc(ring.x, ring.y, 6 + progress * 46, 0, Math.PI * 2);
+      context.stroke();
+    }
+
+    // The pebble in flight.
+    const pebble = world.world.pebble;
+    if (pebble !== null) {
+      context.fillStyle = PALETTE.pebble;
+      context.beginPath();
+      context.arc(pebble.x, pebble.y, 4, 0, Math.PI * 2);
+      context.fill();
+    }
+
+    // Guards: cones first, then the guard, then the ? / ! and the suspicion bar.
+    for (const guard of state.guards) drawCone(def, guard);
+    for (const guard of state.guards) {
+      context.fillStyle = guard.state === 'alert' ? PALETTE.danger : guard.state === 'suspect' ? PALETTE.guardSuspect : PALETTE.guard;
+      context.beginPath();
+      context.arc(guard.x, guard.y, 13, 0, Math.PI * 2);
+      context.fill();
+      // Visor: the direction the guard faces.
+      context.strokeStyle = PALETTE.panel;
+      context.lineWidth = 3;
+      context.beginPath();
+      context.moveTo(guard.x, guard.y);
+      context.lineTo(guard.x + Math.cos(guard.angle) * 13, guard.y + Math.sin(guard.angle) * 13);
+      context.stroke();
+      if (guard.suspicion > 1) {
         const w = 30;
-        ctx.fillStyle = 'rgba(0,0,0,0.55)';
-        ctx.fillRect(guard.x - w / 2, guard.y - GUARD.radius - 12, w, 5);
-        ctx.fillStyle = alert ? '#ff5252' : '#ffca28';
-        ctx.fillRect(guard.x - w / 2, guard.y - GUARD.radius - 12, (w * guard.suspicion) / 100, 5);
+        context.fillStyle = PALETTE.panel;
+        context.fillRect(guard.x - w / 2, guard.y - 26, w, 5);
+        context.fillStyle = guard.state === 'alert' ? PALETTE.danger : PALETTE.guardSuspect;
+        context.fillRect(guard.x - w / 2, guard.y - 26, (w * guard.suspicion) / 100, 5);
       }
-      if (alert || suspect) {
-        ctx.font = 'bold 18px system-ui, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillStyle = alert ? '#ff5252' : '#ffab40';
-        ctx.fillText(alert ? '!' : '?', guard.x, guard.y - GUARD.radius - 16);
+      if (guard.state === 'alert') {
+        text('!', guard.x, guard.y - 30, 22, PALETTE.danger, 'center');
+      } else if (guard.state === 'suspect') {
+        text('?', guard.x, guard.y - 30, 22, PALETTE.guardSuspect, 'center');
+      }
+    }
+
+    // The player: a hooded infiltrator, pale against the dark floor.
+    const player = state.player;
+    const inBush = def.map[Math.floor(player.y / TILE)]?.[Math.floor(player.x / TILE)] === 'B';
+    if (player.invulnerable === 0 || Math.floor(player.invulnerable * 10) % 2 === 1) {
+      context.fillStyle = PALETTE.player;
+      context.beginPath();
+      context.arc(player.x, player.y, 13, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = PALETTE.playerDark;
+      context.beginPath();
+      context.arc(player.x + Math.cos(player.angle) * 5, player.y + Math.sin(player.angle) * 5, 7, 0, Math.PI * 2);
+      context.fill();
+      context.strokeStyle = PALETTE.panel;
+      context.lineWidth = 2;
+      context.beginPath();
+      context.moveTo(player.x, player.y);
+      context.lineTo(player.x + Math.cos(player.angle) * 13, player.y + Math.sin(player.angle) * 13);
+      context.stroke();
+    }
+    if (inBush) {
+      context.fillStyle = 'rgba(44, 107, 60, 0.75)';
+      for (const [ox, oy, r] of [[-8, -6, 6], [8, -8, 6], [0, 8, 7]]) {
+        context.beginPath();
+        context.arc(player.x + ox, player.y + oy, r, 0, Math.PI * 2);
+        context.fill();
       }
     }
   }
 
-  function drawPlayer(world) {
-    const p = world.state.player;
-    if (p.inBush) {
-      ctx.fillStyle = 'rgba(23,61,36,0.85)';
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, PLAYER.radius + 6, 0, Math.PI * 2);
-      ctx.fill();
+  function drawHud(world) {
+    const state = world.state;
+    context.fillStyle = 'rgba(10, 13, 18, 0.82)';
+    context.fillRect(0, 0, FIELD_WIDTH, 34);
+    context.textBaseline = 'top';
+    text(`Score ${world.score}`, 12, 8, 18, PALETTE.text, 'left', 'top');
+    text(`Level ${state.level} — ${world.levelName ?? ''}`, 210, 8, 18, PALETTE.text, 'left', 'top');
+    const mm = String(Math.floor(state.elapsed / 60)).padStart(2, '0');
+    const ss = String(Math.floor(state.elapsed % 60)).padStart(2, '0');
+    text(`${mm}:${ss}`, 470, 8, 18, PALETTE.muted, 'left', 'top');
+    text(`Intel ${state.collected}/${state.intel.length}`, 540, 8, 18, state.exitOpen ? PALETTE.ok : PALETTE.gold, 'left', 'top');
+    text(`Pebbles ${state.pebbles}`, 650, 8, 18, PALETTE.text, 'left', 'top');
+    // Lives as small hearts.
+    for (let i = 0; i < LIVES; i += 1) {
+      const x = 748 + i * 18;
+      context.fillStyle = i < world.lives ? PALETTE.danger : PALETTE.panelEdge;
+      context.beginPath();
+      context.arc(x, 17, 6, 0, Math.PI * 2);
+      context.fill();
     }
-    ctx.fillStyle = '#2de1c2';
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, PLAYER.radius, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = '#06231d';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.lineWidth = 1;
-    // Hood point: where you face.
-    ctx.fillStyle = '#06231d';
-    ctx.beginPath();
-    ctx.arc(p.x + Math.cos(p.angle) * 8, p.y + Math.sin(p.angle) * 8, 4, 0, Math.PI * 2);
-    ctx.fill();
-    if (p.sneaking) {
-      ctx.strokeStyle = 'rgba(45,225,194,0.7)';
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, PLAYER.radius + 5, 0, Math.PI * 2);
-      ctx.stroke();
+    // Alarm bar, bottom left.
+    const barW = 150;
+    context.fillStyle = PALETTE.panel;
+    context.fillRect(12, FIELD_HEIGHT - 24, barW, 10);
+    context.fillStyle = state.alarm > 66 ? PALETTE.danger : state.alarm > 33 ? PALETTE.guardSuspect : PALETTE.ok;
+    context.fillRect(12, FIELD_HEIGHT - 24, (barW * state.alarm) / 100, 10);
+    text('ALARM', 168, FIELD_HEIGHT - 26, 13, PALETTE.muted, 'left', 'top');
+    if (state.ghost) text('GHOST', FIELD_WIDTH - 12, FIELD_HEIGHT - 26, 13, PALETTE.ok, 'right', 'top');
+    else text('SPOTTED', FIELD_WIDTH - 12, FIELD_HEIGHT - 26, 13, PALETTE.danger, 'right', 'top');
+  }
+
+  function drawPanel(title, lines, prompt) {
+    const width = 560;
+    const height = 120 + lines.length * 30 + 56;
+    const x = (FIELD_WIDTH - width) / 2;
+    const y = (FIELD_HEIGHT - height) / 2;
+    context.fillStyle = PALETTE.panel;
+    context.fillRect(x, y, width, height);
+    context.strokeStyle = PALETTE.panelEdge;
+    context.lineWidth = 2;
+    context.strokeRect(x, y, width, height);
+    context.textBaseline = 'alphabetic';
+    text(title, FIELD_WIDTH / 2, y + 58, 40, PALETTE.text, 'center');
+    for (let i = 0; i < lines.length; i += 1) {
+      text(lines[i], FIELD_WIDTH / 2, y + 108 + i * 30, 19, PALETTE.muted, 'center');
+    }
+    text(prompt, FIELD_WIDTH / 2, y + height - 26, 20, PALETTE.gold, 'center');
+  }
+
+  /** Paint one frame: the field, then the HUD or a panel for the screen the game is on. */
+  function draw(world, screen, best) {
+    const state = world.state;
+    const def = world.levelDef;
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.fillStyle = PALETTE.backdrop;
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
+    drawField(world, def);
+    if (screen === SCREEN_TITLE) {
+      drawPanel('GHOSTLINE', [
+        'Night Infiltration — slip in, lift every intel file, slip out.',
+        'Move with WASD or arrows.  Shift runs (loud), C sneaks (quiet).',
+        'Q throws a pebble to lure a guard.  P pauses, M mutes.',
+        `Best score ${best}`,
+      ], 'Press Space or click to start');
+      return;
+    }
+    drawHud(world);
+    if (screen === SCREEN_PAUSED) {
+      drawPanel('Paused', ['The guards will wait for you.'], 'Press P to resume');
+    } else if (screen === SCREEN_CLEAR) {
+      drawPanel(`Level ${state.level - 1} clear`, [
+        `Score ${world.score}`,
+        state.ghost ? 'Ghost bonus kept — nobody raised the alarm.' : 'Spotted — the ghost bonus is gone.',
+      ], 'Press Space for the next level');
+    } else if (screen === SCREEN_OVER) {
+      drawPanel('Caught', [`Score ${world.score}`, `Best ${best}`], 'Press Space to try again');
+    } else if (screen === SCREEN_WIN) {
+      drawPanel('GHOSTLINE complete', [
+        `Final score ${world.score}`,
+        `${world.lives} ${world.lives === 1 ? 'life' : 'lives'} left — every one worth 500.`,
+        `Best ${best}`,
+      ], 'Press Space to play again');
     }
   }
 
-  function drawPebbleAndNoise(world) {
-    if (world.pebble) {
-      ctx.fillStyle = '#cfd8dc';
-      ctx.beginPath();
-      ctx.arc(world.pebble.x, world.pebble.y, 4, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    for (const pulse of world.noisePulses) {
-      const t = pulse.age / 0.6;
-      ctx.strokeStyle = `rgba(255,255,255,${0.55 * (1 - t)})`;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(pulse.x, pulse.y, 8 + pulse.radius * t, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.lineWidth = 1;
-    }
-  }
-
-  function drawHud(game, best) {
-    const s = game.world.state;
-    ctx.fillStyle = 'rgba(8,12,22,0.82)';
-    ctx.fillRect(0, 0, W, 34);
-    ctx.fillStyle = '#e8eefc';
-    ctx.font = 'bold 14px system-ui, sans-serif';
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(s.def.name, 12, 18);
-    // Intel pips.
-    let x = 210;
-    for (let i = 0; i < s.intel.length; i += 1) {
-      ctx.fillStyle = i < s.collected ? '#ffd65a' : 'rgba(255,255,255,0.25)';
-      ctx.fillRect(x, 12, 12, 12);
-      ctx.strokeStyle = '#ffd65a';
-      ctx.strokeRect(x, 12, 12, 12);
-      x += 18;
-    }
-    // Alarm meter.
-    ctx.fillStyle = 'rgba(255,255,255,0.25)';
-    ctx.fillRect(330, 12, 130, 10);
-    ctx.fillStyle = s.alarm > 60 ? '#ff5252' : s.alarm > 25 ? '#ffab40' : '#69f0ae';
-    ctx.fillRect(330, 12, (130 * s.alarm) / 100, 10);
-    ctx.fillStyle = '#e8eefc';
-    ctx.fillText('ALARM', 280, 18);
-    // Lives, time, score.
-    ctx.fillStyle = '#ff8a80';
-    ctx.fillText('♥'.repeat(Math.max(0, game.lives)), 480, 18);
-    ctx.fillStyle = '#e8eefc';
-    const mins = Math.floor(s.time / 60);
-    const secs = Math.floor(s.time % 60);
-    ctx.fillText(`${mins}:${String(secs).padStart(2, '0')}`, 560, 18);
-    ctx.fillText(`SCORE ${game.score}`, 640, 18);
-    ctx.fillText(`PEBBLES ${s.player.pebbles} [Q]`, 770, 18);
-    ctx.textAlign = 'right';
-    ctx.fillText(`BEST ${best}`, W - 12, 18);
-    ctx.textAlign = 'left';
-    // Hint line.
-    ctx.fillStyle = 'rgba(232,238,252,0.75)';
-    ctx.font = '13px system-ui, sans-serif';
-    const hint = s.exitOpen
-      ? 'All intel lifted — reach the green EXIT.'
-      : s.player.inBush
-        ? 'Hidden in the dark — guards barely see you here.'
-        : 'WASD move · SHIFT run (loud) · C sneak · Q throw a pebble · P pause';
-    ctx.fillText(hint, 12, H - 12);
-  }
-
-  function overlay(title, lines, accent) {
-    ctx.fillStyle = 'rgba(5,8,16,0.72)';
-    ctx.fillRect(0, 0, W, H);
-    ctx.textAlign = 'center';
-    ctx.fillStyle = accent;
-    ctx.font = 'bold 46px system-ui, sans-serif';
-    ctx.fillText(title, W / 2, H / 2 - 90);
-    ctx.fillStyle = '#e8eefc';
-    ctx.font = '17px system-ui, sans-serif';
-    lines.forEach((line, i) => {
-      ctx.fillText(line, W / 2, H / 2 - 40 + i * 28);
-    });
-    ctx.textAlign = 'left';
-  }
-
-  return {
-    draw(game, screen, best) {
-      const world = game.world;
-      const s = world.state;
-      ctx.clearRect(0, 0, W, H);
-      drawFloor(s);
-      drawLasers(s);
-      drawIntelAndExit(s);
-      drawGuards(world);
-      drawPlayer(world);
-      drawPebbleAndNoise(world);
-      if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED) drawHud(game, best);
-      if (screen === SCREEN_TITLE) {
-        overlay('GHOSTLINE', [
-          'A night infiltration in three levels. Lift the intel, reach the exit,',
-          'and never let a guard finish his sentence.',
-          '',
-          'WASD / arrows — move      SHIFT — run (loud)      C — sneak',
-          'Q — throw a pebble to pull a guard away      P — pause      M — mute',
-          '',
-          'Bushes hide you. Crates block sight. Lasers blink — cross them dark.',
-          '',
-          'Press SPACE or click to begin.',
-        ], '#2de1c2');
-      } else if (screen === SCREEN_PAUSED) {
-        overlay('PAUSED', ['Press P or SPACE to keep moving.'], '#e8eefc');
-      } else if (screen === SCREEN_CLEAR) {
-        overlay('LEVEL CLEAR', [
-          `Ghost bonus ${s.ghost ? 'kept — no guard ever raised the alarm.' : 'lost — someone saw you.'}`,
-          'Press SPACE for the next level.',
-        ], '#50ffaa');
-      } else if (screen === SCREEN_OVER) {
-        overlay('CAUGHT', [
-          `The guards closed in. Score ${game.score}. Best ${best}.`,
-          'Press SPACE to try the night again.',
-        ], '#ff5252');
-      } else if (screen === SCREEN_WIN) {
-        overlay('GHOST', [
-          'Every file lifted. Every guard still wondering what that noise was.',
-          `Final score ${game.score}. Best ${best}.`,
-          'Press SPACE to run it again.',
-        ], '#ffd65a');
-      }
-    },
-  };
+  resize();
+  window.addEventListener('resize', resize);
+  return { draw };
 }
